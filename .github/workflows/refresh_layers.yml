@@ -30,18 +30,18 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run layer generator
-        run: python uk_drone_to_foreflight.py
+        run: python generate_layers.py
 
       - name: Commit updated layer if changed
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add layers/uk/uk_drone_restrictions.kmz
+          git add layers/
           # Only commit if the file actually changed
           if git diff --staged --quiet; then
-            echo "No changes to the layer — NATS data unchanged since last run."
+            echo "No changes — source data unchanged since last run."
           else
-            AIRAC_DATE=$(date -u +"%Y-%m-%d")
-            git commit -m "chore: refresh UK drone layer (${AIRAC_DATE})"
+            CYCLE_DATE=$(date -u +"%Y-%m-%d")
+            git commit -m "chore: refresh drone layers (${CYCLE_DATE})"
             git push
           fi
