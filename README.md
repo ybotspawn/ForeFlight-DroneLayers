@@ -6,6 +6,6 @@ This repository contains both the code to generate new layers as well as regular
 
 ## Sources
 UK - Generate script utilizes NATS as a direct source for drone flight restrictions
-\tUS - Generate script utilizes FAA as a direct source for drone flight restrictions
+US - Generate script utilizes FAA as a direct source for drone flight restrictions
 EU/CA - Generate script utilizes data curated and obtained free from OpenAIP. (https://www.openaip.net/)
 
