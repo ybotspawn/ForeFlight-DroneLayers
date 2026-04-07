@@ -447,64 +447,275 @@ class USProvider(Provider):
         )
 
 
-# ── Europe Provider (stub) ────────────────────────────────────────────────────
+# ── OpenAIP base provider ─────────────────────────────────────────────────────
 
-class EuropeProvider(Provider):
+# OpenAIP type integer → our category
+# https://api.core.openaip.net (see schema for full enum)
+_OPENAIP_TYPE_MAP = {
+    1:  "RESTRICTED",   # Restricted
+    2:  "DANGER",       # Danger
+    3:  "PROHIBITED",   # Prohibited
+    4:  "FRZ",          # CTR  (Control Zone — around airports)
+    11: "FRZ",          # ATZ  (Aerodrome Traffic Zone)
+    12: "RESTRICTED",   # MATZ (Military ATZ)
+    5:  "CONTROLLED",   # TMZ  (Transponder Mandatory Zone)
+    24: "CONTROLLED",   # CTA  (Control Area)
+    27: "CONTROLLED",   # TMA  (Terminal Maneuvering Area)
+}
+
+# Only fetch these types — keeps requests fast and output relevant for drones
+_OPENAIP_RELEVANT_TYPES = set(_OPENAIP_TYPE_MAP.keys())
+
+
+class OpenAIPProvider(Provider):
     """
-    Source : OpenAIP (community-maintained, used by many aviation apps)
-    URL    : https://api.core.openaip.net/api/airspaces
-    Key    : Free API key required — https://www.openaip.net (Account → API Keys)
-    Cycle  : Continuous updates
-    Status : STUB — set OPENAIP_API_KEY env var to enable
-
-    TODO: Implement fetch() using OpenAIP API filtered by country codes.
-          Iterate over EU country codes, paginate results, convert to KML.
-          Relevant types: 1=Restricted, 2=Danger, 3=Prohibited, 4=CTR, 11=ATZ
+    Base class for any region sourced from OpenAIP.
+    Subclasses declare country_codes and region metadata.
+    Requires OPENAIP_API_KEY environment variable.
     """
 
-    region_code = "eu"
-    region_name = "Europe (OpenAIP)"
-    layer_name  = "EU Drone Restrictions"
-    output_file = "eu_drone_restrictions.kmz"
+    _API_BASE  = "https://api.core.openaip.net/api"
+    _PAGE_SIZE = 100
+
+    # Override in subclass — list of ISO 3166-1 alpha-2 country codes
+    country_codes: list[str] = []
 
     def fetch(self, date_hint=None):
         api_key = os.environ.get("OPENAIP_API_KEY")
         if not api_key:
-            raise NotImplementedError(
-                "EuropeProvider requires OPENAIP_API_KEY env var.\n"
-                "Get a free key at https://www.openaip.net"
+            raise RuntimeError(
+                f"{self.region_name} requires OPENAIP_API_KEY env var.\n"
+                "Get a free key at https://www.openaip.net (Account → API Keys)\n"
+                "Then: export OPENAIP_API_KEY=your_key"
             )
-        raise NotImplementedError("EuropeProvider.fetch() not yet implemented.")
+
+        all_items = []
+        for country in self.country_codes:
+            items = self._fetch_country(country, api_key)
+            all_items.extend(items)
+            print(f"  {country}: {len(items)} zones")
+
+        print(f"  Total: {len(all_items)} zones across {len(self.country_codes)} countries")
+        kml_bytes  = self._items_to_kml(all_items)
+        cycle_date = date.today().strftime("%Y-%m-%d")
+        return kml_bytes, f"OpenAIP data as of {cycle_date}"
+
+    def _fetch_country(self, country: str, api_key: str) -> list:
+        headers = {"x-openaip-api-key": api_key}
+        items   = []
+        page    = 1
+
+        while True:
+            params = {
+                "country": country,
+                "page":    page,
+                "limit":   self._PAGE_SIZE,
+            }
+            r = requests.get(
+                f"{self._API_BASE}/airspaces",
+                headers=headers,
+                params=params,
+                timeout=30,
+            )
+            if r.status_code == 401:
+                raise RuntimeError("OpenAIP API key rejected — check OPENAIP_API_KEY.")
+            r.raise_for_status()
+
+            data  = r.json()
+            batch = [
+                i for i in data.get("items", [])
+                if i.get("type") in _OPENAIP_RELEVANT_TYPES
+            ]
+            items.extend(batch)
+
+            total = data.get("totalCount", 0)
+            fetched_so_far = (page - 1) * self._PAGE_SIZE + len(data.get("items", []))
+            if fetched_so_far >= total or not data.get("items"):
+                break
+            page += 1
+
+        return items
+
+    def _items_to_kml(self, items: list) -> bytes:
+        """Convert OpenAIP airspace items (GeoJSON geometry) to KML bytes."""
+        kml = Element("kml", xmlns="http://www.opengis.net/kml/2.2")
+        doc = SubElement(kml, "Document")
+
+        for item in items:
+            name  = item.get("name", "Unknown")
+            atype = item.get("type")
+            upper = item.get("upperLimit", {})
+            lower = item.get("lowerLimit", {})
+            geom  = item.get("geometry", {})
+
+            if not geom:
+                continue
+
+            pm = SubElement(doc, "Placemark")
+            SubElement(pm, "name").text = name
+            SubElement(pm, "description").text = (
+                f"Type: {atype}\n"
+                f"Upper: {upper.get('value','?')} "
+                f"{self._unit(upper.get('unit'))} {self._ref(upper.get('referenceDatum'))}\n"
+                f"Lower: {lower.get('value','?')} "
+                f"{self._unit(lower.get('unit'))} {self._ref(lower.get('referenceDatum'))}"
+            )
+
+            self._geom_to_kml(pm, geom)
+
+        return tostring(kml, encoding="unicode").encode("utf-8")
+
+    def _geom_to_kml(self, parent: Element, geom: dict) -> None:
+        gtype  = geom.get("type", "")
+        coords = geom.get("coordinates", [])
+        if not coords:
+            return
+
+        def _ring(container, ring_coords):
+            poly  = SubElement(container, "Polygon")
+            SubElement(poly, "altitudeMode").text = "clampToGround"
+            outer = SubElement(poly, "outerBoundaryIs")
+            ring  = SubElement(outer, "LinearRing")
+            SubElement(ring, "coordinates").text = " ".join(
+                f"{c[0]},{c[1]},0" for c in ring_coords
+            )
+
+        if gtype == "Polygon":
+            _ring(parent, coords[0])
+        elif gtype == "MultiPolygon":
+            mg = SubElement(parent, "MultiGeometry")
+            for poly in coords:
+                _ring(mg, poly[0])
 
     def categorise(self, name: str) -> str:
-        raise NotImplementedError
+        # OpenAIP names are plain strings — categorise by KML name prefix lookup
+        # isn't reliable here. Instead we embed the type in the name during
+        # _items_to_kml via a hidden prefix so parse_placemarks can recover it.
+        # This is handled transparently — callers just see the category string.
+        # Fallback: return OTHER (should not happen given type filtering above).
+        return "OTHER"
+
+    def _fetch_country_with_type(self, country: str, api_key: str) -> list:
+        return self._fetch_country(country, api_key)
+
+    @staticmethod
+    def _unit(u) -> str:
+        return {0: "ft", 1: "m", 6: "FL"}.get(u, "")
+
+    @staticmethod
+    def _ref(r) -> str:
+        return {0: "MSL", 1: "AGL", 2: "AMSL"}.get(r, "")
 
 
-# ── Canada Provider (stub) ────────────────────────────────────────────────────
+    def _items_to_kml(self, items: list) -> bytes:
+        """
+        Convert OpenAIP items to KML, embedding the type code in the name
+        as a prefix so categorise() can recover it after parse_placemarks().
+        Format: '__TYPE_N__ Original Name'
+        """
+        kml = Element("kml", xmlns="http://www.opengis.net/kml/2.2")
+        doc = SubElement(kml, "Document")
 
-class CanadaProvider(Provider):
+        for item in items:
+            name  = item.get("name", "Unknown")
+            atype = item.get("type")
+            upper = item.get("upperLimit", {})
+            lower = item.get("lowerLimit", {})
+            geom  = item.get("geometry", {})
+
+            if not geom:
+                continue
+
+            pm = SubElement(doc, "Placemark")
+            # Embed type as prefix so categorise() works after KML round-trip
+            SubElement(pm, "name").text = f"__TYPE_{atype}__ {name}"
+            SubElement(pm, "description").text = (
+                f"Type: {atype}\n"
+                f"Upper: {upper.get('value','?')} "
+                f"{self._unit(upper.get('unit'))} {self._ref(upper.get('referenceDatum'))}\n"
+                f"Lower: {lower.get('value','?')} "
+                f"{self._unit(lower.get('unit'))} {self._ref(lower.get('referenceDatum'))}"
+            )
+            self._geom_to_kml(pm, geom)
+
+        return tostring(kml, encoding="unicode").encode("utf-8")
+
+    def categorise(self, name: str) -> str:
+        # Recover type from embedded prefix '__TYPE_N__ name'
+        m = re.match(r"^__TYPE_(\d+)__", name)
+        if m:
+            return _OPENAIP_TYPE_MAP.get(int(m.group(1)), "OTHER")
+        return "OTHER"
+
+
+# ── Europe Provider ───────────────────────────────────────────────────────────
+
+class EuropeProvider(OpenAIPProvider):
     """
-    Source : NAV CANADA — Aeronautical Information Products
-    URL    : https://www.navcanada.ca/en/aeronautical-information/
-    Key    : TBD — NAV CANADA data access terms vary
-    Status : STUB
+    Source : OpenAIP
+    Key    : OPENAIP_API_KEY env var (free at openaip.net)
+    Covers : 36 European countries including non-EU (Norway, Switzerland, etc.)
+             Does not include UK — that's covered by the superior NATS source.
+    """
 
-    TODO: Investigate NAV CANADA's digital dataset availability.
-          They publish NOTAM and AIP data; drone-specific restriction
-          polygons may be available via their AIM system or third-party
-          (e.g. Drone Pilot Canada aggregates this data).
+    region_code = "eu"
+    region_name = "Europe (OpenAIP)"
+    layer_name  = "Europe Drone Restrictions"
+    output_file = "eu_drone_restrictions.kmz"
+
+    country_codes = [
+        "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR",
+        "DE", "GR", "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL",
+        "PL", "PT", "RO", "SK", "SI", "ES", "SE",  # EU member states
+        "CH", "NO", "IS",                            # EEA / associated
+        "AL", "BA", "ME", "MK", "RS",               # Western Balkans
+        "MD", "UA", "GE",                            # Eastern neighbours
+    ]
+
+    def layer_description(self, cycle_date: str) -> str:
+        return (
+            f"Europe Drone Restrictions — OpenAIP\n"
+            f"Data retrieved: {cycle_date}\n"
+            f"Source: openaip.net (community-maintained)\n\n"
+            f"FRZ / CTR / ATZ : Permission required from aerodrome ATC\n"
+            f"RESTRICTED      : Permission required, may have conditions\n"
+            f"DANGER          : Hazardous — avoid unless confirmed inactive\n"
+            f"PROHIBITED      : Hard no-fly\n\n"
+            f"NOTE: Regulations vary significantly by country.\n"
+            f"      Always verify against national CAA before flying.\n"
+        )
+
+
+# ── Canada Provider ───────────────────────────────────────────────────────────
+
+class CanadaProvider(OpenAIPProvider):
+    """
+    Source : OpenAIP
+    Key    : OPENAIP_API_KEY env var (same key as Europe)
+    Note   : OpenAIP's Canadian coverage is good for controlled/restricted
+             airspace but may be less complete than Transport Canada's own
+             data for some remote areas. Cross-check at tc.canada.ca.
     """
 
     region_code = "ca"
-    region_name = "Canada (NAV CANADA)"
+    region_name = "Canada (OpenAIP)"        # cheeky spelling: Canadia
     layer_name  = "Canada Drone Restrictions"
     output_file = "ca_drone_restrictions.kmz"
 
-    def fetch(self, date_hint=None):
-        raise NotImplementedError("CanadaProvider not yet implemented.")
+    country_codes = ["CA"]
 
-    def categorise(self, name: str) -> str:
-        raise NotImplementedError
+    def layer_description(self, cycle_date: str) -> str:
+        return (
+            f"Canada Drone Restrictions — OpenAIP\n"
+            f"Data retrieved: {cycle_date}\n"
+            f"Source: openaip.net (community-maintained)\n\n"
+            f"FRZ / CTR / ATZ : Permission required from aerodrome ATC\n"
+            f"RESTRICTED      : Permission required\n"
+            f"DANGER          : Hazardous — avoid unless confirmed inactive\n"
+            f"PROHIBITED      : Hard no-fly\n\n"
+            f"NOTE: Always verify against Transport Canada (tc.canada.ca)\n"
+            f"      and check NAV CANADA NOTAMs before flying.\n"
+        )
 
 
 # ── Registry ──────────────────────────────────────────────────────────────────
@@ -516,7 +727,7 @@ PROVIDERS: dict[str, Provider] = {
     "ca": CanadaProvider(),
 }
 
-IMPLEMENTED = {"uk", "us"}   # update as providers are completed
+IMPLEMENTED = {"uk", "us", "eu", "ca"}
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
