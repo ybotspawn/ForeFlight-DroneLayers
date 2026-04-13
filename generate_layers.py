@@ -127,7 +127,7 @@ def _clone_geo(parent: Element, el) -> None:
 def build_kml(placemarks: list, provider, cycle_date: str) -> str:
     kml = Element("kml", xmlns="http://www.opengis.net/kml/2.2")
     doc = SubElement(kml, "Document")
-    SubElement(doc, "name").text        = provider.layer_name
+    SubElement(doc, "name").text        = f"({cycle_date}) {provider.region_code.upper()} Drone"
     SubElement(doc, "description").text = provider.layer_description(cycle_date)
 
     # Styles
